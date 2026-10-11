@@ -15,7 +15,7 @@ When you add a card to Apple Pay, the physical card number (FPAN) is replaced by
 | PN532 NFC module (NFC Shield v3 or compatible) | Must support the UART/HSU interface |
 | PL2303 USB-to-UART adapter | CP210x/CH340 adapters also work |
 | 4 jumper wires (female-female) | GND, VCC, TX, RX |
-| Computer with a free USB port | Linux, macOS, or Windows |
+| Computer with a free USB port | Linux or macOS |
 | iPhone or Apple Watch | With the card already added to Apple Pay |
 
 **Wiring**
@@ -27,7 +27,7 @@ When you add a card to Apple Pay, the physical card number (FPAN) is replaced by
 | TXD | RXD |
 | RXD | TXD |
 
-Set the module's DIP switches to **UART (HSU) mode** (on Elechouse V3 modules: switch 1 OFF, switch 2 ON). Baud rate: **115200**.
+Set the module's DIP switches to **UART (HSU) mode** (on Elechouse V3 modules: switch 1 OFF, switch 2 OFF). Baud rate: **115200**.
 
 ---
 
@@ -42,7 +42,7 @@ Set the module's DIP switches to **UART (HSU) mode** (on Elechouse V3 modules: s
 2. Download the script (`multigo-apple-pay.py`) and set your serial port in the constants at the top:
 
    ```python
-   SERIAL_PORT = "/dev/ttyUSB0"
+   SERIAL_PORT = "/dev/ttyUSB0"   # Linux/macOS
    BAUD_RATE = 115200
    ```
 
@@ -52,23 +52,25 @@ Set the module's DIP switches to **UART (HSU) mode** (on Elechouse V3 modules: s
    sudo usermod -aG dialout $USER   # then log out and back in
    ```
 
-4. Verify the adapter is visible: `ls /dev/ttyUSB*` (Linux), `ls /dev/cu.usbserial*` (macOS).
+4. Verify the adapter is visible: `ls /dev/ttyUSB*` (Linux) or `ls /dev/cu.usbserial*` (macOS).
 
 ---
 
 ## Usage
 
-1. Run the script:
+1. **On the iPhone/Watch: open Wallet and swipe to the card you want to read.** Each double-click session presents only the card shown on screen — if your default card is another one, you will read that one instead.
+
+2. **Double-click the side button** (Face ID/Touch ID confirmation) and hold the device flat against the reader antenna until the logs finish.
+
+3. Run the script:
 
    ```bash
    python3 multigo-apple-pay.py
+   # or explicitly:
+   python3 multigo-apple-pay.py --port /dev/ttyUSB0 --baud 115200
    ```
 
-   It prints `[*] Ready. Double-click Apple Pay and hold near the antenna.`
-
-2. **On the iPhone/Watch: open Wallet and swipe to the card you want to read.** Each double-click session presents only the card shown on screen — if your default card is another one, you will read that one instead.
-
-3. **Double-click the side button** (Face ID/Touch ID confirmation) and hold the device flat against the reader antenna until the logs finish.
+   It verifies the module link first (`PN532 link OK: IC 0x32, firmware v1.6`) — if that check fails, it exits with instructions instead of polling silently. Then it prints `[*] Ready. Double-click Apple Pay and hold near the antenna.`
 
 4. The script runs a full EMV handshake and prints the result:
 
@@ -82,7 +84,7 @@ Set the module's DIP switches to **UART (HSU) mode** (on Elechouse V3 modules: s
 
 6. Enter the 16-digit DPAN into MultiGo's card registration/linkage.
 
-**Timing notes:** double-click sessions are short. If an attempt ends without a result, re-double-click and hold again — the script keeps polling and starts a fresh attempt automatically.
+**Timing notes:** double-click sessions are short (roughly 15–30 seconds). If an attempt ends without a result, re-double-click and hold again — the script keeps polling and starts a fresh attempt automatically.
 
 ---
 
@@ -97,7 +99,7 @@ The script implements a minimal EMV contactless terminal through the PN532:
 5. **READ RECORD** — reads the files the AFL points to. The DPAN typically appears in tag `57` (Track 2 Equivalent Data) or `5A` (Application PAN); Visa may instead return it only in tag `9F6B` inside the **GENERATE AC** response, which the script requests as a fallback with a zero-amount cryptogram.
 6. **Validation** — every candidate must pass a **Luhn check** before being reported, which filters out false positives (e.g. ASCII application labels that decode to digit-like hex).
 
-**Robustness measures**: right after activation, Apple devices respond slowly and the PN532 can report RF errors (`status 0x06`) while card responses lag several exchanges behind. Each stage therefore validates the expected response shape (FCI `6F`, GPO `77`/`80`, record `70`) and re-sends its command until the response is coherent, plus a 200 ms settling delay after detection.
+**Robustness measures** (learned the hard way): right after activation, Apple devices respond slowly and the PN532 can report RF errors (`status 0x06`) while card responses lag several exchanges behind. Each stage therefore validates the expected response shape (FCI `6F`, GPO `77`/`80`, record `70`) and re-sends its command until the response is coherent, plus a 200 ms settling delay after detection.
 
 **Why it can't be used for fraud:** the exchange yields only the static DPAN digits. All transaction cryptograms are dynamic and bound to terminal data — nothing captured here can authorize a payment. The DPAN is also rejected for card-not-present use.
 
@@ -107,10 +109,10 @@ The script implements a minimal EMV contactless terminal through the PN532:
 
 | Area | Support |
 |---|---|
-| Wallet devices | iPhone, Apple Watch |
+| Wallet devices | iPhone, Apple Watch (double-click authentication required) |
 | Card networks | Mastercard (M/Chip) — tested working; Visa (qVSDC, incl. format-1 GPO + GENERATE AC fallback) — supported; Amex and others — untested |
 | Reader hardware | PN532-based modules over UART (PL2303/CP210x/CH340 USB-serial adapters) |
-| Host OS | Linux, macOS, Windows (Python 3.8+, `pyserial`) |
+| Host OS | Linux, macOS (Python 3.8+, `pyserial`) |
 | Serial port | Up to 255-byte response frames (extended PN532 frames are not parsed) |
 
 Not supported: Android/Google Wallet tokens, reader modules other than PN532, I2C/SPI connection modes (UART only).
@@ -128,6 +130,3 @@ Not supported: Android/Google Wallet tokens, reader modules other than PN532, I2
 | Candidate rejected with "Luhn check failed" | False positive (e.g. "DEBIT MASTERCARD" label hex) | Informational only — keep scanning |
 | No serial port found | Driver or permissions | Install PL2303 driver; on Linux add yourself to `dialout` |
 | Records return nothing, GPO fine | Response exceeded 255 bytes or wallet session ended mid-flow | Re-double-click; keep total flow under ~20 s |
-
----
-

@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
 """
 Apple Pay DPAN reader — PN532 (UART over PL2303), EMV contactless.
-
-v3 — key fixes after field testing:
-
-  1. Luhn validation on every PAN candidate. The raw track-2 regex previously
-     matched the ASCII text "DEBIT MASTERCARD" (hex 44454... contains digits
-     and a 'D') and reported it as a 16-digit number. DPANs are Luhn-valid
-     by spec, so candidates that fail Luhn are logged and rejected.
-  2. Stage validation + bounded resend. Right after field activation the
-     PN532 reports RF/DEP errors (status 0x06) and card responses lag
-     behind the host exchanges (a stale PPSE FCI can arrive several
-     exchanges late). Each stage now validates the expected response shape
-     (FCI=6F, GPO=77/80, record=70) and re-sends its command until the
-     response matches — which self-heals the desync.
-  3. 200 ms settling delay after target detection before the first APDU.
-  4. v4 — Visa support: qVSDC wallets often answer GPO with "format 1"
-     (template 80: 16 bytes of amount fields, then normal TLV), which the
-     TLV parser never recursed into; the GPO stage now strips that header,
-     and the GENERATE AC fallback uses a typical CDOL1 when the records
-     contained no 8C tag (Visa often hides the DPAN there, tag 9F6B).
 """
 
 import serial
@@ -99,6 +80,8 @@ def luhn_ok(digits: str) -> bool:
 class PN532UART:
     def __init__(self, port, baudrate=115200):
         self.ser = serial.Serial(port, baudrate=baudrate, timeout=2.0)
+        self.link_failures = 0   # consecutive calls without any ACK/response
+        self.last_status = -1   # PN532 status byte of the last exchange
 
     def _calc_checksum(self, data: bytes) -> int:
         return (~sum(data) + 1) & 0xFF
@@ -120,17 +103,25 @@ class PN532UART:
     def read_response(self) -> bytes:
         header = self.ser.read(3)
         while header and header != bytes([0x00, 0x00, 0xFF]):
-            # responses > 255 bytes use the extended frame format
-            # (00 00 FF FF FF ...) which this parser does not handle
             header = header[1:] + self.ser.read(1)
         if not header:
             return b""
         length_info = self.ser.read(2)
         if len(length_info) < 2:
             return b""
-        length, lcs = length_info
-        if ((length + lcs) & 0xFF) != 0:
-            return b""
+        if length_info == b"\xff\xff":
+            # extended frame: 00 00 FF FF FF <LEN:2> <LCS> <TFI+DATA> DCS 00
+            ext = self.ser.read(3)
+            if len(ext) < 3:
+                return b""
+            length = int.from_bytes(ext[:2], byteorder="big")
+            # per PN532 spec: LEN_hi + LEN_lo + LCS = 0 (mod 256)
+            if ((ext[0] + ext[1] + ext[2]) & 0xFF) != 0:
+                return b""
+        else:
+            length, lcs = length_info
+            if ((length + lcs) & 0xFF) != 0:
+                return b""
         payload = self.ser.read(length)
         self.ser.read(2)  # DCS + postamble
         if len(payload) >= 2 and payload[0] == 0xD5:
@@ -141,24 +132,83 @@ class PN532UART:
         self.send_command(bytes([0xD4, cmd]) + params)
         time.sleep(0.015)
         if not self.read_ack():
+            self.link_failures += 1
             return b""
-        return self.read_response()
+        res = self.read_response()
+        if res:
+            self.link_failures = 0
+        else:
+            self.link_failures += 1
+        return res
 
-    def wakeup_and_config(self):
-        self.ser.write(bytes([0x55, 0x55, 0x00, 0x00, 0x00, 0x00]))
-        time.sleep(0.05)
+    def wakeup_and_config(self) -> bool:
+        ok = False
+        for attempt in range(1, 4):
+            self.ser.write(bytes([0x55, 0x55, 0x00, 0x00, 0x00, 0x00]))
+            time.sleep(0.05)
+            # link sanity check — if this fails, every poll silently
+            # waits out the serial timeout (slow dots, no targets)
+            fw = self.call(0x02)  # GetFirmwareVersion
+            if fw and len(fw) >= 4:
+                print(f"[+] PN532 link OK: IC 0x{fw[0]:02X}, "
+                      f"firmware v{fw[1]}.{fw[2]}")
+                ok = True
+                break
+            print(f"[-] PN532 not answering (try {attempt}/3)...")
+            time.sleep(0.3)
+        if not ok:
+            print("[-] PN532 did not answer GetFirmwareVersion.")
+            print("    - is the serial port correct? (ls /dev/ttyUSB* / COMx)")
+            print("    - DIP switches in UART/HSU mode?")
+            print("    - another process holding the port? "
+                  "(lsof /dev/ttyUSB0)")
+            print("    - unplug/replug the adapter "
+                  "(full module power cycle)")
+            return False
         self.call(0x14, bytes([0x01, 0x14, 0x01]))        # SAMConfiguration
-        self.call(0x32, bytes([0x05, 0xFF, 0x01, 0x00]))  # retries
+        # Adafruit-style, battle-tested retry limits (MxRtyATR=0xFE RATS
+        # retries, MxRtyPassiveActivation=0x0B activation attempts,
+        # MxRtyData=0x08 data-error retries). The previous [0xFF,0x01,0x00]
+        # allowed only a single activation attempt — too marginal for the
+        # sensitive RF handshake of Apple devices.
+        self.call(0x32, bytes([0x05, 0xFE, 0x0B, 0x08]))
         self.call(0x32, bytes([0x01, 0x01]))             # RF field on
+        return True
 
     def reset_field(self):
         self.call(0x32, bytes([0x01, 0x00]))  # RF off
         time.sleep(0.05)
         self.call(0x32, bytes([0x01, 0x01]))  # RF on
 
+    def soft_recover(self):
+        """Between EMV attempts: release any stuck DEP session and toggle
+        the RF field, so the next poll starts from a clean state."""
+        self.call(0x52, bytes([0x01]))  # InRelease
+        self.reset_field()
+
     def poll_target(self) -> bool:
-        res = self.call(0x4A, bytes([0x01, 0x00]))
-        return len(res) > 0 and res[0] >= 1
+        res = self.call(0x4A, bytes([0x02, 0x00]))  # up to 2 targets
+        if len(res) > 0 and res[0] >= 1:
+            if res[0] > 1:
+                print("\n[!] Multiple targets in the field — remove any "
+                      "plastic card or other contactless card from the "
+                      "antenna, then retry")
+            return True
+        return False
+
+    def reactivate(self) -> bool:
+        """Release and re-run passive activation.
+
+        Empirically, Apple devices answer reliably for the exchange right
+        after ISO-DEP activation and then the RF/DEP layer errors out
+        (PN532 status 0x06) on subsequent exchanges. Re-activating the
+        target before each retry restores a working exchange. The wallet
+        stays authenticated during this, so the EMV application state
+        (selected AID etc.) is preserved.
+        """
+        self.call(0x52, bytes([0x01]))      # InRelease
+        time.sleep(0.02)
+        return self.poll_target()
 
     def send_apdu(self, apdu: bytes, label: str = ""):
         """One InDataExchange. Returns (body, sw_bytes). Dumps everything."""
@@ -167,6 +217,7 @@ class PN532UART:
             log(f"    [{label}] no PN532 frame at all")
             return b"", b""
         status = res[0]
+        self.last_status = status
         data = res[1:]
         sw = data[-2:] if len(data) >= 2 else b""
         body = data[:-2] if len(data) >= 2 else b""
@@ -197,6 +248,18 @@ class PN532UART:
             s = sw.hex().upper()
             if s in ("6E00", "6981", "6985", "6A82"):
                 return body, sw
+            # two PN532 timeouts in a row: the wallet session is gone;
+            # further resends cannot resuscitate it — the outer loop
+            # will re-poll for a fresh double-click session
+            if self.last_status == 0x01 and i >= 2 and not body:
+                log(f"    [{label}] target gone (PN532 timeout) — stopping")
+                return b"", b""
+            # RF/DEP-layer failure while the target is still present:
+            # release and re-activate it, then resend — with Apple devices
+            # the first exchange after each activation is the reliable one
+            if self.last_status in (0x05, 0x06, 0x13, 0x27, 0x29) and not body:
+                log(f"    [{label}] RF-layer error — re-activating target")
+                self.reactivate()
             time.sleep(delay)
         return b"", b""
 
@@ -243,7 +306,11 @@ def extract_tlv(data: bytes, tag: int) -> bytes:
 
 
 def extract_all_tlv(data: bytes, tag: int) -> list:
-    """Non-recursive scan for every occurrence of a 1- or 2-byte tag."""
+    """Scan for every occurrence of a tag at ANY TLV nesting depth.
+
+    The PPSE FCI nests 4F AIDs inside 61 templates inside BF0C inside A5
+    inside 6F — a flat top-level scan finds nothing there.
+    """
     out = []
     i = 0
     while i < len(data):
@@ -267,8 +334,11 @@ def extract_all_tlv(data: bytes, tag: int) -> list:
                 break
             ln = int.from_bytes(data[i:i + nb], byteorder="big")
             i += nb
+        value = data[i:i + ln]
         if t == tag:
-            out.append(data[i:i + ln])
+            out.append(value)
+        if (t if t < 0x100 else (t >> 8)) & 0x20:  # constructed -> recurse
+            out.extend(extract_all_tlv(value, tag))
         if i + ln > len(data):
             break
         i += ln
@@ -370,9 +440,22 @@ def _is_gpo(body, sw):        return body[0] in (0x77, 0x80)
 def _is_record(body, sw):     return body[0] == 0x70
 
 
+def _report_cardholder(body: bytes, seen: dict):
+    """Print tag 5F20 (cardholder name) once, if the wallet exposes it.
+    Useful for apps (e.g. MultiGo) that match on card number + name."""
+    if not body or seen.get("name"):
+        return
+    nm = extract_tlv(body, 0x5F20)
+    if nm:
+        seen["name"] = True
+        print(f"[+] Cardholder name (tag 5F20): "
+              f"{nm.decode('ascii', 'ignore').strip()!r}")
+
+
 def emv_read_dpan(nfc: PN532UART):
     # 0. let the wallet's NFC stack settle after activation
     time.sleep(0.2)
+    cardholder = {}
 
     # 1. SELECT PPSE — validated (must be a 6F FCI), resent until coherent
     ppse_apdu = bytes.fromhex("00A404000E") + bytes.fromhex(PPSE) + b"\x00"
@@ -413,6 +496,7 @@ def emv_read_dpan(nfc: PN532UART):
         # 16 bytes of amount fields followed by normal TLV (57, 94, ...)
         scan_gpo = gpo_body[16:] if gpo_body[0] == 0x80 else gpo_body
         pan, exp, src = find_pan(gpo_body, scan_gpo)
+        _report_cardholder(scan_gpo, cardholder)
         if pan:
             return pan, exp, src, f"{src} in GPO response"
 
@@ -434,6 +518,7 @@ def emv_read_dpan(nfc: PN532UART):
                     if not body or body[0] != 0x70:
                         continue
                     cdol1 = extract_tlv(body, 0x8C) or cdol1
+                    _report_cardholder(body, cardholder)
                     pan, exp, src = find_pan(body)
                     if pan:
                         return pan, exp, src, f"{src} in record SFI{sfi}#{r}"
@@ -455,9 +540,19 @@ def emv_read_dpan(nfc: PN532UART):
 
 
 def main():
-    nfc = PN532UART(SERIAL_PORT, BAUD_RATE)
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Read the Apple Pay DPAN with a PN532 UART reader")
+    ap.add_argument("-p", "--port", default=SERIAL_PORT,
+                    help="serial port (default: %(default)s)")
+    ap.add_argument("-b", "--baud", type=int, default=BAUD_RATE,
+                    help="baud rate (default: %(default)s)")
+    args = ap.parse_args()
+
+    nfc = PN532UART(args.port, args.baud)
     print("[*] Initializing PN532...")
-    nfc.wakeup_and_config()
+    if not nfc.wakeup_and_config():
+        sys.exit(1)
     print("[*] Ready. Double-click Apple Pay and hold near the antenna.")
     attempt = 0
     while True:
@@ -481,7 +576,13 @@ def main():
                 return
             print("[-] Attempt finished without a PAN. Re-double-click the "
                   "side button for the next attempt...")
-            nfc.reset_field()
+            nfc.soft_recover()
+        elif nfc.link_failures >= 10:
+            print("\n[!] PN532 has gone silent (no ACK to 10+ commands)")
+            print("    re-initializing the link; if this repeats, unplug/"
+                  "replug the adapter for a full module power cycle")
+            nfc.wakeup_and_config()
+            nfc.link_failures = 0
         time.sleep(0.15)
 
 
